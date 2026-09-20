@@ -1,0 +1,17 @@
+# /etc/nfs-stale-monitor/nfs-stale-monitor.conf
+#
+# Configuration for nfs-stale-monitor. Sourced by the daemon, so each line is a
+# plain shell variable assignment. Restart the service after editing:
+#
+#     systemctl restart nfs-stale-monitor
+
+# How often (seconds) to run a full check / remount pass. This is the schedule.
+INTERVAL=60
+
+# How long (seconds) a single mount probe may block before the mount is
+# declared hung. Healthy mounts return in milliseconds; a value of 10 is plenty.
+STAT_TIMEOUT=10
+
+# How long (seconds) a forced umount may block before we fall back to a lazy
+# umount. Only relevant when a mount is wedged.
+UMOUNT_TIMEOUT=10

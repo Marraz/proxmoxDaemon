@@ -1,0 +1,16 @@
+[Unit]
+Description=Monitor and recover stale NFS mounts (Proxmox node)
+Documentation=file:///usr/local/share/nfs-stale-monitor/README.md
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/nfs-stale-monitor
+Restart=always
+RestartSec=5
+# The daemon must stat and unmount, so it runs as root.
+User=root
+
+[Install]
+WantedBy=multi-user.target

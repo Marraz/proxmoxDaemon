@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+#
+# nfs-stale-monitor — detect and recover stale NFS mounts on a Proxmox node.
+#
+# Runs as a long-lived daemon (under systemd). On a fixed, configurable interval
+# it probes every NFS/NFS4 mountpoint on the node. A mount that no longer
+# responds (hung, or returning ESTALE / "stale file handle") is force-umounted.
+# After the full pass, if at least one mount was reclaimed, `mount -a` is run so
+# the unmounted (stale) mounts are remounted from /etc/fstab.
+#
+# All output goes to the journal (stdout). Requires root (it must be able to
+# stat and unmount).
+
+set -u
+
+# --- defaults (overridden by the config file) ---
+INTERVAL=60          # seconds between full check passes
+STAT_TIMEOUT=10      # seconds a single mount probe may block before "hung"
+UMOUNT_TIMEOUT=10    # seconds a forced umount may block before lazy fallback
+CONFIG_FILE="${NFS_STALE_MONITOR_CONF:-/etc/nfs-stale-monitor/nfs-stale-monitor.conf}"
+
+log() { printf '%s [nfs-stale-monitor] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+
+# --- load config ---
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$CONFIG_FILE"
+else
+  log "config not found at $CONFIG_FILE — using built-in defaults"
+fi
+
+# validate numeric config
+for v in INTERVAL STAT_TIMEOUT UMOUNT_TIMEOUT; do
+  val="${!v}"
+  if ! [[ "$val" =~ ^[0-9]+$ ]] || (( val < 1 )); then
+    log "ERROR: $v must be a positive integer, got '$val'"
+    exit 1
+  fi
+done
+
+# Collect NFS/NFS4 mountpoints from /proc/mounts (whitespace-separated:
+# <dev> <mountpoint> <fstype> <opts> ...). fstype matches nfs, nfs4, nfsv4...
+nfs_mountpoints() {
+  awk '$3 ~ /^nfs/ { print $2 }' /proc/mounts 2>/dev/null
+}
+
+# Probe a mountpoint. Returns 0 if healthy, non-zero if stale or hung.
+mount_is_healthy() {
+  local mp="$1" rc
+  # `stat` must succeed quickly. A hung NFS mount blocks until STAT_TIMEOUT
+  # (timeout exits 124); a stale handle or dead server makes stat fail.
+  # We run as root, so permission errors should not occur on a healthy mount.
+  timeout "$STAT_TIMEOUT" stat "$mp" >/dev/null 2>&1
+  rc=$?
+  [[ "$rc" -eq 0 ]]
+}
+
+# Force-unmount a (possibly hung) mountpoint. Returns 0 if it is gone.
+reclaim_mount() {
+  local mp="$1"
+  log "stale/hung NFS mount: $mp — reclaiming"
+  # Try a forced unmount with a timeout; if the mount is fully wedged, fall
+  # back to a lazy unmount, which detaches immediately and reclaims later.
+  if ! timeout "$UMOUNT_TIMEOUT" umount -f "$mp" 2>/dev/null; then
+    if umount -l "$mp" 2>/dev/null; then
+      log "lazy-umounted: $mp"
+    fi
+  fi
+  # Verify the mount is actually gone.
+  if timeout "$STAT_TIMEOUT" mountpoint -q "$mp" 2>/dev/null; then
+    log "warning: $mp still mounted after reclaim attempt"
+    return 1
+  fi
+  log "reclaimed: $mp"
+}
+
+run_pass() {
+  local reclaimed=0 mp
+  local -a mounts=()
+  mapfile -t mounts < <(nfs_mountpoints)
+
+  if (( ${#mounts[@]} == 0 )); then
+    log "no NFS mounts present — nothing to do"
+    return 0
+  fi
+
+  log "checking ${#mounts[@]} NFS mount(s): ${mounts[*]}"
+
+  for mp in "${mounts[@]}"; do
+    if mount_is_healthy "$mp"; then
+      log "healthy: $mp"
+    else
+      if reclaim_mount "$mp"; then
+        reclaimed=$((reclaimed + 1))
+      fi
+    fi
+  done
+
+  if (( reclaimed > 0 )); then
+    log "reclaimed $reclaimed mount(s); running 'mount -a' to remount"
+    if mount -a 2>&1; then
+      log "'mount -a' completed"
+    else
+      log "warning: 'mount -a' returned non-zero — some mounts may need attention"
+    fi
+  fi
+}
+
+log "starting (interval=${INTERVAL}s stat_timeout=${STAT_TIMEOUT}s umount_timeout=${UMOUNT_TIMEOUT}s config=$CONFIG_FILE)"
+
+# Graceful stop so systemd can shut us down cleanly.
+trap 'log "shutting down"; exit 0' TERM INT
+
+while :; do
+  run_pass
+  # Sleep in the background so a signal wakes us up immediately instead of
+  # waiting out the full interval.
+  sleep "$INTERVAL" &
+  wait $! 2>/dev/null
+done
