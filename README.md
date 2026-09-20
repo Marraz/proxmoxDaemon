@@ -40,6 +40,15 @@ there (which is how Proxmox cluster / ZFS + NFS datastores are typically set
 up). Mounts that are not in `/etc/fstab` will be unmounted but not remounted —
 so keep your NFS entries in `/etc/fstab`.
 
+> **Proxmox note:** Proxmox NFS datastores are normally declared in
+> `/etc/pve/storage.cfg`, **not** `/etc/fstab`. If yours are only in
+> `storage.cfg`, add a matching line to `/etc/fstab` (e.g.
+> `unbeast.marraz.me:/mnt/user/isos  /mnt/pve/unBeastNFS  nfs  rw,hard,vers=4.2,_netdev,nofail  0  0`)
+> so `mount -a` can remount them after a reclaim. Use `_netdev` (wait for
+> network) and `nofail` (never abort boot if the server is down) — but **not**
+> `noauto`, because `mount -a` skips `noauto` entries and this daemon relies on
+> `mount -a` to bring mounts back.
+
 ## Requirements
 
 - A Proxmox (Debian-based) node, with **root** (the daemon must be able to

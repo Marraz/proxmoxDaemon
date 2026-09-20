@@ -66,9 +66,10 @@ reclaim_mount() {
       log "lazy-umounted: $mp"
     fi
   fi
-  # Verify the mount is actually gone.
-  if timeout "$STAT_TIMEOUT" mountpoint -q "$mp" 2>/dev/null; then
-    log "warning: $mp still mounted after reclaim attempt"
+  # Verify the mount is actually gone (check /proc/mounts, not mountpoint — a
+  # stale mount still counts as "mounted" to mountpoint).
+  if awk -v m="$mp" '$2==m && $3 ~ /^nfs/ { found=1 } END { exit !found }' /proc/mounts 2>/dev/null; then
+    log "warning: $mp still listed in /proc/mounts after reclaim attempt"
     return 1
   fi
   log "reclaimed: $mp"
@@ -98,7 +99,8 @@ run_pass() {
 
   if (( reclaimed > 0 )); then
     log "reclaimed $reclaimed mount(s); running 'mount -a' to remount"
-    if mount -a 2>&1; then
+    # Wrap in a timeout so a wedged remount cannot hang the daemon (or the node).
+    if timeout "$(( STAT_TIMEOUT * 3 ))" mount -a 2>&1; then
       log "'mount -a' completed"
     else
       log "warning: 'mount -a' returned non-zero — some mounts may need attention"
