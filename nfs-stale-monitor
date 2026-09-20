@@ -21,7 +21,7 @@
 set -u
 
 # --- defaults (overridden by the config file) ---
-INTERVAL=60          # seconds between full check passes
+INTERVAL=300          # seconds between full check passes
 STAT_TIMEOUT=10      # seconds a single mount probe may block before "hung"
 UMOUNT_TIMEOUT=15    # seconds a forced/lazy umount may block before giving up
 STORAGE_CFG=/etc/pve/storage.cfg   # Proxmox storage config (for id/path mapping)

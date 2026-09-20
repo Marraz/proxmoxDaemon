@@ -109,7 +109,7 @@ The file is plain shell (it is `source`d by the daemon):
 
 | Variable         | Default | Meaning |
 |------------------|---------|---------|
-| `INTERVAL`       | `60`    | **How often to run a check/recover pass, in seconds.** This is the schedule. |
+| `INTERVAL`       | `300`   | **How often to run a check/recover pass, in seconds.** This is the schedule. |
 | `STAT_TIMEOUT`   | `10`    | How long a single mount probe may block before the mount is declared **hung**. |
 | `UMOUNT_TIMEOUT` | `15`    | How long the forced/lazy `umount -f -l` may block before giving up. |
 | `RECOVER_SETTLE` | `5`     | How long (seconds) to poll after re-enabling a storage to confirm it re-mounted. |

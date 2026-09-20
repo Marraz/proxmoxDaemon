@@ -6,7 +6,7 @@
 #     systemctl restart nfs-stale-monitor
 
 # How often (seconds) to run a full check / recover pass. This is the schedule.
-INTERVAL=60
+INTERVAL=300
 
 # How long (seconds) a single mount probe may block before the mount is
 # declared hung. Healthy mounts return in milliseconds; a value of 10 is plenty.
