@@ -4,19 +4,29 @@
 #
 # Runs as a long-lived daemon (under systemd). On a fixed, configurable interval
 # it probes every NFS/NFS4 mountpoint on the node. A mount that no longer
-# responds (hung, or returning ESTALE / "stale file handle") is force-umounted.
-# After the full pass, if at least one mount was reclaimed, `mount -a` is run so
-# the unmounted (stale) mounts are remounted from /etc/fstab.
+# responds (hung, or returning ESTALE / "stale file handle") is recovered by
+# detaching it and cycling the owning Proxmox storage:
+#
+#     umount -f -l <mountpoint>              # detach the dead connection instantly
+#     pvesm set <storage_id> --disable 1     # stop the storage
+#     pvesm set <storage_id> --disable 0     # re-activate it (Proxmox re-mounts)
+#
+# Each stale mount is recovered independently, so only the affected storage is
+# cycled (minimal blast radius). The mountpoint -> storage_id mapping is read
+# from /etc/pve/storage.cfg.
 #
 # All output goes to the journal (stdout). Requires root (it must be able to
-# stat and unmount).
+# stat, unmount, and run pvesm).
 
 set -u
 
 # --- defaults (overridden by the config file) ---
 INTERVAL=60          # seconds between full check passes
 STAT_TIMEOUT=10      # seconds a single mount probe may block before "hung"
-UMOUNT_TIMEOUT=10    # seconds a forced umount may block before lazy fallback
+UMOUNT_TIMEOUT=15    # seconds a forced/lazy umount may block before giving up
+STORAGE_CFG=/etc/pve/storage.cfg   # Proxmox storage config (for id/path mapping)
+RECOVER_SETTLE=5     # seconds to poll after re-activating a storage to confirm remount
+PVE_SM_TIMEOUT=60    # seconds a `pvesm set` may block before giving up
 CONFIG_FILE="${NFS_STALE_MONITOR_CONF:-/etc/nfs-stale-monitor/nfs-stale-monitor.conf}"
 
 log() { printf '%s [nfs-stale-monitor] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
@@ -30,12 +40,13 @@ else
 fi
 
 # validate numeric config
-for v in INTERVAL STAT_TIMEOUT UMOUNT_TIMEOUT; do
+for v in INTERVAL STAT_TIMEOUT UMOUNT_TIMEOUT RECOVER_SETTLE PVE_SM_TIMEOUT; do
   val="${!v}"
-  if ! [[ "$val" =~ ^[0-9]+$ ]] || (( val < 1 )); then
-    log "ERROR: $v must be a positive integer, got '$val'"
+  if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+    log "ERROR: $v must be a non-negative integer, got '$val'"
     exit 1
   fi
+  (( INTERVAL >= 1 )) || { log "ERROR: INTERVAL must be >= 1"; exit 1; }
 done
 
 # Collect NFS/NFS4 mountpoints from /proc/mounts (whitespace-separated:
@@ -55,28 +66,64 @@ mount_is_healthy() {
   [[ "$rc" -eq 0 ]]
 }
 
-# Force-unmount a (possibly hung) mountpoint. Returns 0 if it is gone.
-reclaim_mount() {
+# Map a mountpoint to its Proxmox NFS storage id using storage.cfg.
+# storage.cfg is a flat "storage-type: id" + indented "key value" format.
+storage_id_for_path() {
   local mp="$1"
-  log "stale/hung NFS mount: $mp — reclaiming"
-  # Try a forced unmount with a timeout; if the mount is fully wedged, fall
-  # back to a lazy unmount, which detaches immediately and reclaims later.
-  if ! timeout "$UMOUNT_TIMEOUT" umount -f "$mp" 2>/dev/null; then
-    if umount -l "$mp" 2>/dev/null; then
-      log "lazy-umounted: $mp"
-    fi
-  fi
-  # Verify the mount is actually gone (check /proc/mounts, not mountpoint — a
-  # stale mount still counts as "mounted" to mountpoint).
-  if awk -v m="$mp" '$2==m && $3 ~ /^nfs/ { found=1 } END { exit !found }' /proc/mounts 2>/dev/null; then
-    log "warning: $mp still listed in /proc/mounts after reclaim attempt"
+  [[ -r "$STORAGE_CFG" ]] || return 1
+  awk -v m="$mp" '
+    /^nfs:/    { id = $2; next }
+    /^[^ \t]/  { id = ""; next }        # a new top-level entry ends the current one
+    id && $1 == "path" && $2 == m { print id; exit }
+  ' "$STORAGE_CFG" 2>/dev/null
+}
+
+# Recover a stale mountpoint by detaching it and cycling its Proxmox storage.
+# Returns 0 if the mountpoint is healthy again.
+recover_mount() {
+  local mp="$1" sid
+  log "stale/hung NFS mount: $mp — recovering"
+
+  sid="$(storage_id_for_path "$mp")"
+  if [[ -z "$sid" ]]; then
+    log "  $mp is not a Proxmox NFS storage in $STORAGE_CFG — cannot auto-recover (leaving it; check manually)"
     return 1
   fi
-  log "reclaimed: $mp"
+  log "  storage id: $sid"
+
+  # 1. Detach the dead connection instantly (lazy force unmount).
+  if ! timeout "$UMOUNT_TIMEOUT" umount -f -l "$mp" 2>&1; then
+    log "  warning: umount -f -l $mp returned non-zero; continuing (lazy unmount is best-effort)"
+  fi
+
+  # 2. Cycle the storage so Proxmox cleanly re-mounts it.
+  if timeout "$PVE_SM_TIMEOUT" pvesm set "$sid" --disable 1 2>&1; then
+    log "  storage disabled"
+  else
+    log "  warning: pvesm set $sid --disable 1 failed"
+  fi
+  if timeout "$PVE_SM_TIMEOUT" pvesm set "$sid" --disable 0 2>&1; then
+    log "  storage re-enabled"
+  else
+    log "  warning: pvesm set $sid --disable 0 failed"
+  fi
+
+  # 3. Wait for the remount to settle, then confirm the mount is healthy again.
+  local waited=0
+  while (( waited < RECOVER_SETTLE )); do
+    if mount_is_healthy "$mp"; then
+      log "  recovered: $mp ($sid)"
+      return 0
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  log "  warning: $mp still not healthy after re-enabling $sid"
+  return 1
 }
 
 run_pass() {
-  local reclaimed=0 mp
+  local recovered=0 failed=0 mp
   local -a mounts=()
   mapfile -t mounts < <(nfs_mountpoints)
 
@@ -91,24 +138,26 @@ run_pass() {
     if mount_is_healthy "$mp"; then
       log "healthy: $mp"
     else
-      if reclaim_mount "$mp"; then
-        reclaimed=$((reclaimed + 1))
+      if recover_mount "$mp"; then
+        recovered=$(( recovered + 1 ))
+      else
+        failed=$(( failed + 1 ))
       fi
     fi
   done
 
-  if (( reclaimed > 0 )); then
-    log "reclaimed $reclaimed mount(s); running 'mount -a' to remount"
-    # Wrap in a timeout so a wedged remount cannot hang the daemon (or the node).
-    if timeout "$(( STAT_TIMEOUT * 3 ))" mount -a 2>&1; then
-      log "'mount -a' completed"
-    else
-      log "warning: 'mount -a' returned non-zero — some mounts may need attention"
-    fi
-  fi
+  log "pass complete: ${#mounts[@]} checked, $recovered recovered, $failed failed"
 }
 
-log "starting (interval=${INTERVAL}s stat_timeout=${STAT_TIMEOUT}s umount_timeout=${UMOUNT_TIMEOUT}s config=$CONFIG_FILE)"
+log "starting (interval=${INTERVAL}s stat_timeout=${STAT_TIMEOUT}s umount_timeout=${UMOUNT_TIMEOUT}s storage_cfg=$STORAGE_CFG config=$CONFIG_FILE)"
+
+# One-shot mode: run a single check/recover pass and exit (useful for cron,
+# manual checks, or testing).
+if [[ "${1:-}" == "--once" || "${1:-}" == "check" ]]; then
+  log "one-shot pass (--once)"
+  run_pass
+  exit 0
+fi
 
 # Graceful stop so systemd can shut us down cleanly.
 trap 'log "shutting down"; exit 0' TERM INT

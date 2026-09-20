@@ -5,13 +5,23 @@
 #
 #     systemctl restart nfs-stale-monitor
 
-# How often (seconds) to run a full check / remount pass. This is the schedule.
+# How often (seconds) to run a full check / recover pass. This is the schedule.
 INTERVAL=60
 
 # How long (seconds) a single mount probe may block before the mount is
 # declared hung. Healthy mounts return in milliseconds; a value of 10 is plenty.
 STAT_TIMEOUT=10
 
-# How long (seconds) a forced umount may block before we fall back to a lazy
-# umount. Only relevant when a mount is wedged.
-UMOUNT_TIMEOUT=10
+# How long (seconds) the forced/lazy umount of a stale mount may block before
+# giving up.
+UMOUNT_TIMEOUT=15
+
+# How long (seconds) to wait/poll after re-enabling a storage to confirm it
+# re-mounted. Proxmox usually re-mounts within a second or two.
+RECOVER_SETTLE=5
+
+# How long (seconds) a single `pvesm set` may block before giving up.
+PVE_SM_TIMEOUT=60
+
+# Proxmox storage config, used to map a mountpoint to its storage id.
+STORAGE_CFG=/etc/pve/storage.cfg
